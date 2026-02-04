@@ -4,19 +4,22 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import os
-from dotenv import load_dotenv
 
-load_dotenv()
-
-TOKEN = os.getenv("TOKEN")
+# -----------------------------
+# Wczytywanie zmiennych środowiskowych
+TOKEN = os.getenv("TOKEN")           # token bota
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))  # ID kanału do powiadomień
-
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
-
 CYLERIA = "https://cyleria.pl"
+# -----------------------------
 
-# ---------- SCRAPING ----------
+# -----------------------------
+# INTENTS → niezbędne do komend
+intents = discord.Intents.default()
+intents.message_content = True  # pozwala na komendy typu !sprawdz
+bot = commands.Bot(command_prefix="!", intents=intents)
+# -----------------------------
+
+# ---------- SCRAPING DOMKÓW ----------
 
 def get_houses():
     url = f"{CYLERIA}/?subtopic=houses"
@@ -43,14 +46,11 @@ def get_houses():
                 "address": address,
                 "map": map_link
             })
-
     return houses
-
 
 def get_last_login(player):
     url = f"{CYLERIA}/?subtopic=characters&name={player.replace(' ', '+')}"
     soup = BeautifulSoup(requests.get(url).text, "html.parser")
-
     rows = soup.find_all("tr")
     for row in rows:
         if "Last Login" in row.text:
@@ -61,7 +61,6 @@ def get_last_login(player):
                 return None
     return None
 
-
 # ---------- KOMENDY ----------
 
 @bot.command()
@@ -69,9 +68,8 @@ async def info(ctx):
     await ctx.send("""
 **📌 Dostępne komendy**
 !info – pokazuje wszystkie komendy  
-!sprawdz [miasto] – pokazuje 5 najdłużej offline właścicieli domków, filtr na miasto opcjonalny  
+!sprawdz [miasto] – pokazuje 5 najdłużej offline właścicieli domków, filtr na miasto opcjonalny
 """)
-
 
 @bot.command()
 async def sprawdz(ctx, *, miasto=None):
@@ -89,14 +87,18 @@ async def sprawdz(ctx, *, miasto=None):
             continue
 
         offline_delta = datetime.utcnow() - last
+        offline_days = offline_delta.days
+        offline_hours = offline_delta.seconds // 3600
+        offline_minutes = (offline_delta.seconds % 3600) // 60
 
         results.append({
             "owner": h["owner"],
             "city": h["city"],
             "address": h["address"],
             "map": h["map"],
-            "offline_days": offline_delta.days,
-            "offline_hours": offline_delta.seconds // 3600
+            "offline_days": offline_days,
+            "offline_hours": offline_hours,
+            "offline_minutes": offline_minutes
         })
 
     results.sort(key=lambda x: x["offline_days"], reverse=True)
@@ -112,12 +114,11 @@ async def sprawdz(ctx, *, miasto=None):
 **{r['owner']}**
 📍 {r['city']} – {r['address']}
 🗺 {r['map']}
-⏱ {r['offline_days']} dni {r['offline_hours']} godzin offline
+⏱ {r['offline_days']} dni {r['offline_hours']} godzin {r['offline_minutes']} minut offline
 """
     await ctx.send(msg)
 
-
-# ---------- POWIADOMIENIA ----------
+# ---------- POWIADOMIENIA O 13 DNI ----------
 
 @tasks.loop(minutes=60)
 async def check_13_days():
@@ -135,26 +136,32 @@ async def check_13_days():
         offline_delta = datetime.utcnow() - last
         offline_days = offline_delta.days
         offline_hours = offline_delta.seconds // 3600
-        remaining = timedelta(days=14) - offline_delta
+        offline_minutes = (offline_delta.seconds % 3600) // 60
 
+        remaining = timedelta(days=14) - offline_delta
         remaining_days = remaining.days
         remaining_hours = remaining.seconds // 3600
+        remaining_minutes = (remaining.seconds % 3600) // 60
 
         if offline_days == 13:
             await channel.send(
-                f"⚠️ **{h['owner']}** ma domek w {h['city']} – {h['address']} i jest offline {offline_days} dni {offline_hours} godzin!\n"
-                f"⏳ Do wystawienia: {remaining_days} dni {remaining_hours} godzin."
+                f"⚠️ **{h['owner']}** ma domek w {h['city']} – {h['address']} i jest offline "
+                f"{offline_days} dni {offline_hours} godzin {offline_minutes} minut!\n"
+                f"⏳ Do wystawienia: {remaining_days} dni {remaining_hours} godzin {remaining_minutes} minut."
             )
         elif offline_days >= 14:
             await channel.send(
-                f"🏠 **{h['owner']}** domek w {h['city']} – {h['address']} został wystawiony na sprzedaż! ({offline_days} dni offline)"
+                f"🏠 **{h['owner']}** domek w {h['city']} – {h['address']} został wystawiony na sprzedaż! "
+                f"({offline_days} dni offline)"
             )
 
+# ---------- EVENT ON READY ----------
 
 @bot.event
 async def on_ready():
     print(f"Zalogowano jako {bot.user}")
-    check_13_days.start()
+    check_13_days.start()  # start powiadomień
 
+# ---------- URUCHOMIENIE BOTA ----------
 
 bot.run(TOKEN)
