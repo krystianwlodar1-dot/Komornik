@@ -4,6 +4,7 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 import os
+import asyncio
 
 TOKEN = os.getenv("TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
@@ -16,15 +17,20 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 CACHE = []
 LAST_UPDATE = None
 
+# =========================
+# SCRAPING
+# =========================
+
 def get_all_players():
     players = []
     page = 0
 
     while True:
         url = f"{CYLERIA}/?subtopic=highscores&list=experience&world=0&page={page}"
-        soup = BeautifulSoup(requests.get(url).text, "html.parser")
-        table = soup.find("table")
+        r = requests.get(url, timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
 
+        table = soup.find("table")
         if not table:
             break
 
@@ -41,7 +47,8 @@ def get_all_players():
 
 def get_character_info(name):
     url = f"{CYLERIA}/?subtopic=characters&name={name.replace(' ', '+')}"
-    soup = BeautifulSoup(requests.get(url).text, "html.parser")
+    r = requests.get(url, timeout=15)
+    soup = BeautifulSoup(r.text, "html.parser")
 
     house = None
     last_login = None
@@ -58,39 +65,56 @@ def get_character_info(name):
 
     return house, last_login
 
+# =========================
+# UTILS
+# =========================
+
 def hours_left(last_login):
-    offline = (datetime.now() - last_login).total_seconds() / 3600
-    return max(0, 14*24 - offline)
+    offline_hours = (datetime.now() - last_login).total_seconds() / 3600
+    return max(0, 14*24 - offline_hours)
+
+# =========================
+# CACHE BUILDER (ASYNC SAFE)
+# =========================
 
 @tasks.loop(hours=1)
 async def update_cache():
     global CACHE, LAST_UPDATE
-    print("🔄 Aktualizuję cache domków…")
+    print("🔄 Aktualizuję cache domków...")
 
+    players = await asyncio.to_thread(get_all_players)
     results = []
-    players = get_all_players()
 
     for p in players:
-        house, last_login = get_character_info(p)
+        house, last_login = await asyncio.to_thread(get_character_info, p)
         if not house or not last_login:
             continue
 
         offline_days = (datetime.now() - last_login).total_seconds() / 86400
-        if offline_days >= 7:
+        if offline_days >= 7:  # bierzemy tych którzy zbliżają się do sprzedaży
             results.append((p, house, last_login))
 
     CACHE = results
     LAST_UPDATE = datetime.now()
-    print(f"Zaktualizowano cache: {len(CACHE)} domków")
+    print(f"✅ Cache gotowy: {len(CACHE)} domków")
+
+# =========================
+# COMMANDS
+# =========================
 
 @bot.command()
 async def info(ctx):
-    await ctx.send("**Komendy:**\n!sprawdz – TOP 5 domków\n!sprawdz <miasto>\n!top20 – ranking 20 domków do przejęcia")
+    await ctx.send(
+        "**Komendy:**\n"
+        "!sprawdz – TOP 5 domków do przejęcia\n"
+        "!sprawdz <miasto>\n"
+        "!top20 – ranking TOP 20"
+    )
 
 @bot.command()
 async def sprawdz(ctx, city=None):
     if not CACHE:
-        await ctx.send("⏳ Cache się jeszcze buduje, spróbuj za minutę.")
+        await ctx.send("⏳ Cache jeszcze się buduje...")
         return
 
     filtered = []
@@ -107,42 +131,53 @@ async def sprawdz(ctx, city=None):
         await ctx.send("❌ Brak domków dla tego filtra.")
         return
 
-    msg = "**🏠 TOP 5 do przejęcia:**\n"
+    msg = "**🏠 TOP 5 domków do przejęcia:**\n"
     for p, h, d in filtered:
-        msg += f"**{p}**\n{h}\n⏳ {hours_left(d):.1f}h do sprzedaży\n\n"
+        msg += f"**{p}**\n{h}\n⏳ {hours_left(d):.1f}h\n\n"
 
     await ctx.send(msg)
 
 @bot.command()
 async def top20(ctx):
     if not CACHE:
-        await ctx.send("⏳ Cache się jeszcze buduje.")
+        await ctx.send("⏳ Cache jeszcze się buduje...")
         return
 
-    ranked = sorted(CACHE, key=lambda x: hours_left(x[2]))
-    ranked = [x for x in ranked if (datetime.now()-x[2]).total_seconds()/86400 >= 10]
+    ranked = [x for x in CACHE if (datetime.now()-x[2]).total_seconds()/86400 >= 10]
+    ranked.sort(key=lambda x: hours_left(x[2]))
     ranked = ranked[:20]
 
     msg = "**🏆 TOP 20 domków do przejęcia:**\n"
-    for i,(p,h,d) in enumerate(ranked,1):
+    for i, (p, h, d) in enumerate(ranked, 1):
         msg += f"{i}. **{p}** – {h}\n⏳ {hours_left(d):.1f}h\n\n"
 
     await ctx.send(msg)
+
+# =========================
+# ALERT 13 DAY
+# =========================
 
 @tasks.loop(minutes=30)
 async def alert_loop():
     if not CACHE:
         return
+
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
         return
 
-    for p,h,d in CACHE:
-        offline = (datetime.now()-d).total_seconds()/86400
+    for p, h, d in CACHE:
+        offline = (datetime.now() - d).total_seconds() / 86400
         if 13 <= offline < 14:
             await channel.send(
-                f"⚠️ **ALERT DOMKU**\n{p}\n{h}\nZa {hours_left(d):.1f}h do sprzedaży"
+                f"⚠️ **ALERT DOMKU**\n"
+                f"{p}\n{h}\n"
+                f"Za {hours_left(d):.1f}h domek trafi na sprzedaż!"
             )
+
+# =========================
+# START
+# =========================
 
 @bot.event
 async def on_ready():
