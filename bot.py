@@ -15,7 +15,7 @@ CYLERIA = "https://cyleria.pl"
 # -----------------------------
 # INTENTS → niezbędne do komend
 intents = discord.Intents.default()
-intents.message_content = True  # pozwala na komendy typu !sprawdz
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 # -----------------------------
 
@@ -68,9 +68,11 @@ async def info(ctx):
     await ctx.send("""
 **📌 Dostępne komendy**
 !info – pokazuje wszystkie komendy  
-!sprawdz [miasto] – pokazuje 5 najdłużej offline właścicieli domków, filtr na miasto opcjonalny
+!sprawdz [miasto] – pokazuje 5 najdłużej offline właścicieli domków w danym mieście (filtr opcjonalny)  
+!sprawdzall – pokazuje wszystkich właścicieli offline min. 10 dni (bez filtra miasta)
 """)
 
+# Komenda z filtrem miasta
 @bot.command()
 async def sprawdz(ctx, *, miasto=None):
     await ctx.send("⏳ Sprawdzam domki...")
@@ -110,6 +112,53 @@ async def sprawdz(ctx, *, miasto=None):
 
     msg = "**🏠 Najdłużej offline właściciele domków:**\n\n"
     for r in top:
+        msg += f"""
+**{r['owner']}**
+📍 {r['city']} – {r['address']}
+🗺 {r['map']}
+⏱ {r['offline_days']} dni {r['offline_hours']} godzin {r['offline_minutes']} minut offline
+"""
+    await ctx.send(msg)
+
+# Komenda globalna, wszyscy właściciele offline >=10 dni
+@bot.command()
+async def sprawdzall(ctx):
+    await ctx.send("⏳ Sprawdzam wszystkie domki (offline ≥10 dni)...")
+
+    houses = get_houses()
+    results = []
+
+    for h in houses:
+        last = get_last_login(h["owner"])
+        if not last:
+            continue
+
+        offline_delta = datetime.utcnow() - last
+        offline_days = offline_delta.days
+        if offline_days < 10:
+            continue  # pomiń tych offline <10 dni
+
+        offline_hours = offline_delta.seconds // 3600
+        offline_minutes = (offline_delta.seconds % 3600) // 60
+
+        results.append({
+            "owner": h["owner"],
+            "city": h["city"],
+            "address": h["address"],
+            "map": h["map"],
+            "offline_days": offline_days,
+            "offline_hours": offline_hours,
+            "offline_minutes": offline_minutes
+        })
+
+    results.sort(key=lambda x: x["offline_days"], reverse=True)
+
+    if not results:
+        await ctx.send("Nie znaleziono właścicieli offline ≥10 dni.")
+        return
+
+    msg = "**🏠 Właściciele domków offline ≥10 dni:**\n\n"
+    for r in results[:20]:  # pokaż maks. 20 wyników, żeby nie zalać kanału
         msg += f"""
 **{r['owner']}**
 📍 {r['city']} – {r['address']}
