@@ -51,13 +51,17 @@ def get_houses():
 def get_last_login(player):
     url = f"{CYLERIA}/?subtopic=characters&name={player.replace(' ', '+')}"
     soup = BeautifulSoup(requests.get(url).text, "html.parser")
+
     rows = soup.find_all("tr")
     for row in rows:
         if "Last Login" in row.text:
             date_str = row.find_all("td")[1].text.strip()
+
+            # Cyleria format: 04.02.2026 (08:29)
             try:
-                return datetime.strptime(date_str, "%d %b %Y, %H:%M:%S")
-            except:
+                return datetime.strptime(date_str, "%d.%m.%Y (%H:%M)")
+            except Exception as e:
+                print("Błąd parsowania daty:", date_str)
                 return None
     return None
 
