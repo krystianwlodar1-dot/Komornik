@@ -1,228 +1,248 @@
+import os
+import asyncio
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime, timezone, timedelta
 import discord
 from discord.ext import commands, tasks
-import aiohttp
-import asyncio
-from bs4 import BeautifulSoup
-from datetime import datetime, timedelta, timezone
-import os
 
+# ----------------------------
+# CONFIG
+# ----------------------------
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
-BASE = "https://cyleria.pl"
-
-CITIES = [
-    "Cyleria City",
-    "Celestial City",
-    "Volcano City",
-    "Ankardia City",
-    "Dekane City",
-    "Olimpus City"
-]
+MIN_LEVEL = 600        # minimalny lvl postaci która może mieć domek
+OFFLINE_DAYS = 10      # minimalna ilość dni offline żeby domek był do przejęcia
+UPDATE_INTERVAL = 60*60  # w sekundach, co ile aktualizujemy cache
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-cache = []
-progress = {"done": 0, "total": 0, "start": None}
-alerted = set()
+# ----------------------------
+# CACHE
+# ----------------------------
+cache = {}
+cache_ready = False
+progress_msg = None
 
-# ---------------- HTTP ----------------
+# ----------------------------
+# FUNKCJE PARSERÓW
+# ----------------------------
 
-async def fetch(session, url):
-    try:
-        async with session.get(url, timeout=10) as r:
-            return await r.text()
-    except:
-        return None
+def get_all_houses():
+    """Pobiera wszystkie domki z Cyleria i tworzy mapę: nazwa -> info"""
+    url = "https://cyleria.pl/?subtopic=houses"
+    resp = requests.get(url)
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-# ---------------- PARSING ----------------
+    houses = {}
+    table = soup.find("table")
+    if not table:
+        return houses
 
-def parse_offline(text):
-    try:
-        return datetime.strptime(text.strip(), "%d.%m.%Y (%H:%M)")
-    except:
-        return None
-
-async def get_all_players(session):
-    players = []
-    page = 1
-    while True:
-        url = f"{BASE}/?subtopic=highscores&list=experience&world=0&page={page}"
-        html = await fetch(session, url)
-        if not html:
-            break
-        soup = BeautifulSoup(html, "html.parser")
-        rows = soup.select("table.TableContent tr")[1:]
-        if not rows:
-            break
-        for r in rows:
-            cols = r.find_all("td")
-            if len(cols) >= 2:
-                players.append(cols[1].text.strip())
-        page += 1
-    return players
-
-async def get_character(session, name):
-    url = f"{BASE}/?subtopic=characters&name={name.replace(' ', '+')}"
-    html = await fetch(session, url)
-    if not html:
-        return None
-    soup = BeautifulSoup(html, "html.parser")
-
-    house = None
-    city = None
-    last = None
-
-    for tr in soup.find_all("tr"):
-        tds = tr.find_all("td")
-        if len(tds) != 2:
+    for row in table.find_all("tr")[1:]:
+        cols = row.find_all("td")
+        if len(cols) < 4:
             continue
-        key = tds[0].text.strip()
-        val = tds[1].text.strip()
+        name = cols[0].text.strip()
+        size = int(cols[1].text.strip())
+        owner = cols[2].text.strip()
+        status = cols[3].text.strip()
+        # Link do mapki jeśli istnieje
+        link = cols[0].find("a")
+        map_link = link['href'] if link else None
+        houses[name] = {
+            "size": size,
+            "owner": owner,
+            "status": status,
+            "map": map_link
+        }
+    return houses
 
-        if key == "Last Login:":
-            last = parse_offline(val)
 
-        if key == "House:":
-            house = val
-            for c in CITIES:
-                if c.lower() in val.lower():
-                    city = c
+def get_character_info(name):
+    """Pobiera info o postaci: lvl, domek, ostatnie logowanie"""
+    url = f"https://cyleria.pl/?subtopic=characters&name={name}"
+    resp = requests.get(url)
+    soup = BeautifulSoup(resp.text, "html.parser")
+    text = soup.get_text(separator="\n")
 
-    if not house or not last:
-        return None
+    # lvl
+    lvl = 0
+    for line in text.splitlines():
+        if "Level" in line:
+            try:
+                lvl = int(line.split(":")[1].strip())
+            except:
+                lvl = 0
+            break
 
-    return {
-        "name": name,
-        "house": house,
-        "city": city,
-        "last": last
-    }
+    # domek
+    house = None
+    for line in text.splitlines():
+        if "Domek" in line:
+            house = line.split(":", 1)[1].strip()
+            break
 
-# ---------------- CACHE ----------------
+    # ostatnie logowanie
+    last_login = None
+    for line in text.splitlines():
+        if "Logowanie" in line:
+            date_str = line.split(":", 1)[1].strip()
+            try:
+                last_login = datetime.strptime(date_str, "%d.%m.%Y (%H:%M)").replace(tzinfo=timezone.utc)
+            except:
+                last_login = datetime.now(timezone.utc)
+            break
 
-@tasks.loop(minutes=30)
-async def update_cache():
-    global cache, progress
+    return lvl, house, last_login
 
-    await bot.wait_until_ready()
-    channel = bot.get_channel(CHANNEL_ID)
 
-    async with aiohttp.ClientSession() as session:
-        players = await get_all_players(session)
-        progress = {"done": 0, "total": len(players), "start": datetime.now(timezone.utc)}
-        cache = []
+async def update_cache_progress(ctx=None):
+    """Aktualizacja cache z ETA i paskiem postępu"""
+    global cache, cache_ready, progress_msg
+    cache_ready = False
+    houses_map = get_all_houses()
+    all_players = []
 
-        msg = await channel.send("🔄 Rozpoczynam skan Cylerii...")
+    # Pobieramy listę wszystkich graczy z highscores
+    offset = 0
+    while True:
+        url = f"https://cyleria.pl/?subtopic=highscores&list=experience&world=0&minLevel={MIN_LEVEL}&start={offset}"
+        resp = requests.get(url)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        table = soup.find("table")
+        if not table or len(table.find_all("tr")) <= 1:
+            break
+        for row in table.find_all("tr")[1:]:
+            cols = row.find_all("td")
+            if len(cols) < 2:
+                continue
+            player_name = cols[1].text.strip()
+            all_players.append(player_name)
+        offset += 2000  # kolejne strony
 
-        sem = asyncio.Semaphore(20)
+    total = len(all_players)
+    done = 0
+    start = datetime.now(timezone.utc)
 
-        async def worker(name):
-            async with sem:
-                data = await get_character(session, name)
-                progress["done"] += 1
-                if data:
-                    days = (datetime.now(timezone.utc) - data["last"]).days
-                    if days >= 10:
-                        data["days"] = days
-                        cache.append(data)
+    new_cache = {}
+    for p in all_players:
+        try:
+            lvl, house, last_login = get_character_info(p)
+        except:
+            continue
+        done += 1
+        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+        eta = int(elapsed / done * (total - done)) if done else 0
 
-        tasks_list = [worker(p) for p in players]
+        if house and house in houses_map and lvl >= MIN_LEVEL:
+            offline_days = (datetime.now(timezone.utc) - last_login).days
+            new_cache[p] = {
+                "lvl": lvl,
+                "house": house,
+                "offline_days": offline_days,
+                "city": houses_map[house]["size"],  # size placeholder
+                "status": houses_map[house]["status"],
+                "map": houses_map[house]["map"]
+            }
 
-        for i in range(0, len(tasks_list), 50):
-            await asyncio.gather(*tasks_list[i:i+50])
+        # Progress update co 50 graczy
+        if done % 50 == 0 and ctx and progress_msg:
+            bar_len = 20
+            filled = int(done / total * bar_len)
+            bar = "█" * filled + "-" * (bar_len - filled)
+            await progress_msg.edit(content=f"Cache building: `{bar}` {done}/{total} | ETA ~{eta}s")
 
-            done = progress["done"]
-            total = progress["total"]
-            percent = int(done / total * 100)
-            elapsed = int((datetime.now(timezone.utc) - progress["start"]).total_seconds())
-            eta = int(elapsed / done * (total - done)) if done > 0 else 0
+    cache = new_cache
+    cache_ready = True
+    if ctx and progress_msg:
+        await progress_msg.edit(content=f"✅ Cache gotowy – {len(cache)} domków.")
 
-            await msg.edit(content=f"🔄 Skan Cylerii\nPostęp: {done}/{total} ({percent}%)\nDomków: {len(cache)}\nETA: ~{eta//60}m {eta%60}s")
-
-    await channel.send(f"✅ Cache gotowy – {len(cache)} domków.")
-
-# ---------------- ALERTS ----------------
-
-@tasks.loop(minutes=5)
-async def alert_loop():
-    await bot.wait_until_ready()
-    channel = bot.get_channel(CHANNEL_ID)
-
-    for h in cache:
-        if h["days"] == 12 and h["name"] not in alerted:
-            alerted.add(h["name"])
-            await channel.send(
-                f"🚨 **DOMEK ZA 24H**\n"
-                f"{h['name']}\n"
-                f"{h['house']}\n"
-                f"Offline: {h['days']} dni"
-            )
-
-# ---------------- COMMANDS ----------------
-
-@bot.command()
-async def info(ctx):
-    await ctx.send(
-        "!sprawdz [miasto]\n"
-        "!top20\n"
-        "!ultra [miasto]\n"
-        "!status"
-    )
-
-@bot.command()
-async def status(ctx):
-    if progress["total"] == 0:
-        await ctx.send("Cache nie był jeszcze budowany.")
-    else:
-        done = progress["done"]
-        total = progress["total"]
-        percent = int(done/total*100)
-        await ctx.send(f"Cache: {done}/{total} ({percent}%) | Domków: {len(cache)}")
-
-def filter_city(data, city):
-    if not city:
-        return data
-    return [x for x in data if x["city"] and city.lower() in x["city"].lower()]
-
-@bot.command()
-async def sprawdz(ctx, *, city=None):
-    data = filter_city(cache, city)
-    data = sorted(data, key=lambda x: -x["days"])[:5]
-    if not data:
-        await ctx.send("Brak domków.")
-        return
-    msg = ""
-    for h in data:
-        msg += f"{h['name']} | {h['house']} | {h['days']} dni\n"
-    await ctx.send(msg)
-
-@bot.command()
-async def top20(ctx):
-    data = sorted(cache, key=lambda x: -x["days"])[:20]
-    msg = ""
-    for h in data:
-        msg += f"{h['name']} | {h['house']} | {h['days']} dni\n"
-    await ctx.send(msg)
-
-@bot.command()
-async def ultra(ctx, *, city=None):
-    data = [x for x in cache if x["days"] >= 10]
-    data = filter_city(data, city)
-    data = sorted(data, key=lambda x: -x["days"])[:10]
-    msg = ""
-    for h in data:
-        msg += f"{h['name']} | {h['house']} | {h['days']} dni\n"
-    await ctx.send(msg)
-
-# ---------------- START ----------------
+# ----------------------------
+# EVENTS
+# ----------------------------
 
 @bot.event
 async def on_ready():
-    print("Zalogowano jako", bot.user)
-    update_cache.start()
-    alert_loop.start()
+    print(f"Zalogowano jako {bot.user}")
+    channel = bot.get_channel(CHANNEL_ID)
+    if channel:
+        global progress_msg
+        progress_msg = await channel.send("🔄 Rozpoczynam skan Cylerii...")
+        await update_cache_progress(ctx=channel)
+    else:
+        print("Nie znaleziono kanału!")
 
+# ----------------------------
+# KOMENDY
+# ----------------------------
+
+@bot.command()
+async def info(ctx):
+    msg = """
+**Komendy bota Cyleria**
+!info - pokazuje wszystkie komendy
+!sprawdz - pokazuje wszystkie domki do przejęcia 10+ dni offline
+!ultra - domki 10+ dni offline i 600+ lvl
+!top20 - top 20 najstarszych offline domków
+"""
+    await ctx.send(msg)
+
+
+@bot.command()
+async def sprawdz(ctx):
+    if not cache_ready:
+        await ctx.send("Cache nie był jeszcze budowany.")
+        return
+    result = []
+    for p, data in cache.items():
+        if data["offline_days"] >= OFFLINE_DAYS:
+            result.append(f"{p} | {data['house']} | {data['offline_days']} dni offline | {data['map']}")
+    if not result:
+        await ctx.send("Nie znaleziono domków dla tego filtra")
+        return
+    await ctx.send("\n".join(result[:20]))
+
+
+@bot.command()
+async def ultra(ctx):
+    if not cache_ready:
+        await ctx.send("Cache nie był jeszcze budowany.")
+        return
+    result = []
+    for p, data in cache.items():
+        if data["offline_days"] >= OFFLINE_DAYS and data["lvl"] >= MIN_LEVEL:
+            result.append(f"{p} | {data['house']} | lvl {data['lvl']} | {data['offline_days']} dni offline | {data['map']}")
+    if not result:
+        await ctx.send("Nie znaleziono domków dla tego filtra")
+        return
+    await ctx.send("\n".join(result[:20]))
+
+
+@bot.command()
+async def top20(ctx):
+    if not cache_ready:
+        await ctx.send("Cache nie był jeszcze budowany.")
+        return
+    # sortujemy po offline_days
+    top = sorted(cache.items(), key=lambda x: x[1]["offline_days"], reverse=True)
+    msg = []
+    for p, data in top[:20]:
+        msg.append(f"{p} | {data['house']} | lvl {data['lvl']} | {data['offline_days']} dni offline | {data['map']}")
+    await ctx.send("\n".join(msg))
+
+
+@bot.command()
+async def status(ctx):
+    if not cache_ready:
+        await ctx.send("Cache nie był jeszcze budowany.")
+    else:
+        await ctx.send(f"Cache gotowy – {len(cache)} domków.")
+
+# ----------------------------
+# RUN BOT
+# ----------------------------
 bot.run(TOKEN)
