@@ -1,140 +1,94 @@
 import os
-import asyncio
 import json
-from datetime import datetime, timezone
+import asyncio
 import requests
 from bs4 import BeautifulSoup
+from datetime import datetime, timezone
+from discord.ext import commands, tasks
 import discord
-from discord.ext import commands
 
-# ================== CONFIG ==================
-TOKEN = os.getenv("DISCORD_TOKEN")
-DISCORD_CHANNEL = os.getenv("DISCORD_CHANNEL")
-CACHE_FILE = "houses_cache.json"
-BASE_HOUSES_URL = "https://cyleria.pl/?subtopic=houses"
-BASE_HIGHSCORES_URL = "https://cyleria.pl/?subtopic=highscores"
-MIN_LEVEL_FOR_HOUSE = 600
-# ============================================
+# ====== VARIABLES from Railway environment ======
+TOKEN = os.environ.get("DISCORD_TOKEN")
+DISCORD_CHANNEL = int(os.environ.get("DISCORD_CHANNEL"))  # must be an integer ID
+BASE_URL_HOUSES = "https://cyleria.pl/?subtopic=houses"
+BASE_URL_PLAYERS = "https://cyleria.pl/?subtopic=highscores"
+CACHE_FILE = "cache.json"
 
+# ====== BOT SETUP ======
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 cache = []
 
-# ---------------- Helper Functions ----------------
-def save_cache(data):
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def load_cache():
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
-
+# ====== FETCHING FUNCTIONS ======
 def fetch_houses():
-    """Pobiera listę domków ze strony."""
-    houses = []
-    resp = requests.get(BASE_HOUSES_URL)
+    resp = requests.get(BASE_URL_HOUSES)
+    resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
-    rows = soup.select("tr")  # każda linia tabeli
-    for row in rows[1:]:  # pomijamy nagłówek
+    houses = []
+
+    table_rows = soup.select("table tbody tr")
+    for row in table_rows:
         cells = row.find_all("td")
         if len(cells) < 4:
             continue
+        name = cells[0].get_text(strip=True)
         try:
-            name = cells[0].get_text(strip=True)
             size = int(cells[1].get_text(strip=True))
-            player = cells[2].get_text(strip=True)
-            status = cells[3].get_text(strip=True)
-            # Pobranie linku do mapki
-            map_link_tag = cells[0].find("a")
-            map_link = map_link_tag["href"] if map_link_tag else None
-
-            houses.append({
-                "name": name,
-                "size": size,
-                "player": player,
-                "status": status,
-                "map_link": map_link
-            })
         except ValueError:
             continue
+        player = cells[2].get_text(strip=True) or "Brak"
+        last_login_text = cells[3].get_text(strip=True)
+        map_link_tag = cells[0].find("a")
+        map_link = map_link_tag["href"] if map_link_tag else None
+
+        houses.append({
+            "name": name,
+            "size": size,
+            "player": player,
+            "last_login": last_login_text,
+            "map_link": map_link,
+        })
     return houses
 
-def fetch_player_login(player_name):
-    """Zwraca datetime ostatniego logowania gracza."""
-    resp = requests.get(BASE_HIGHSCORES_URL)
-    soup = BeautifulSoup(resp.text, "html.parser")
-    rows = soup.select("tr")
-    for row in rows[1:]:
-        cells = row.find_all("td")
-        if len(cells) < 5:
-            continue
-        name = cells[1].get_text(strip=True)
-        if name != player_name:
-            continue
-        last_login_str = cells[4].get_text(strip=True)
-        try:
-            last_login = datetime.strptime(last_login_str, "%d.%m.%Y (%H:%M)")
-            return last_login.replace(tzinfo=timezone.utc)
-        except:
-            return None
-    return None
+def save_cache_to_file():
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
 
-# ---------------- Cache Builder ----------------
+def load_cache_from_file():
+    global cache
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+
+# ====== CACHE BUILDING ======
 async def build_cache(ctx=None):
     global cache
     houses = fetch_houses()
+    cache = []
+
     total = len(houses)
-    saved_houses = []
-
-    for i, house in enumerate(houses, 1):
-        saved_houses.append(house)
-
-        # Pasek postępu liczbowy
+    for idx, house in enumerate(houses, start=1):
+        cache.append(house)
         if ctx:
-            try:
-                await ctx.send(f"🔄 Budowanie cache: {i}/{total} domków")
-            except:
-                pass
-        await asyncio.sleep(0.05)  # lekki delay
+            await ctx.send(f"🔄 Budowanie cache: {idx}/{total} domków")
+        else:
+            print(f"🔄 Budowanie cache: {idx}/{total} domków")
 
-    cache = saved_houses
-    save_cache(cache)
+    save_cache_to_file()
 
     if ctx:
-        await ctx.send(f"✅ Cache gotowy! Znaleziono {len(cache)} domków.")
+        await ctx.send(f"✅ Cache zbudowany. Znaleziono {len(cache)} domków.")
+    print(f"✅ Cache zbudowany. Znaleziono {len(cache)} domków.")
 
-    return cache
-
-# ---------------- Discord Events ----------------
-@bot.event
-async def on_ready():
-    print(f"Zalogowano jako {bot.user}")
-
-    # Pobranie kanału z DISCORD_CHANNEL
-    ctx = None
-    if DISCORD_CHANNEL:
-        for guild in bot.guilds:
-            ctx = discord.utils.get(guild.text_channels, name=DISCORD_CHANNEL)
-            if ctx:
-                break
-
-    if ctx:
-        await ctx.send("🔄 Rozpoczynam skan Cylerii...")
-
-    # Budowanie cache przy starcie
-    await build_cache(ctx=ctx)
-
-# ---------------- Commands ----------------
+# ====== DISCORD COMMANDS ======
 @bot.command()
 async def status(ctx):
     if not cache:
         await ctx.send("⚠️ Cache nie był jeszcze budowany!")
         return
-    await ctx.send(f"✅ Cache gotowy, liczba domków: {len(cache)}")
+    await ctx.send(f"✅ Cache gotowy – {len(cache)} domków.")
 
 @bot.command()
 async def sprawdz(ctx):
@@ -142,27 +96,64 @@ async def sprawdz(ctx):
         await ctx.send("⚠️ Cache nie był jeszcze budowany!")
         return
 
-    text = "🏠 Domki do przejęcia:\n"
+    houses_to_show = []
     for house in cache:
-        # tu można dodać logikę filtrowania (np. wolne domki)
-        if house["status"].lower() == "aktywny" or house["player"].lower() == "brak":
+        if house["player"].lower() == "brak" or "aktywny" in house["player"].lower():
             link = f" [📍]({house['map_link']})" if house["map_link"] else ""
-            text += f"{house['name']} - {house['size']} - {house['player']}{link}\n"
+            houses_to_show.append(f"{house['name']} - {house['size']} - {house['player']}{link}")
 
-    await ctx.send(text or "Brak domków spełniających kryteria.")
+    if not houses_to_show:
+        await ctx.send("Brak domków spełniających kryteria.")
+        return
+
+    # wysyłanie w kawałkach po 25 domków
+    chunk_size = 25
+    for i in range(0, len(houses_to_show), chunk_size):
+        chunk = houses_to_show[i:i+chunk_size]
+        text = "\n".join(chunk)
+        await ctx.send(f"🏠 Domki do przejęcia:\n```{text}```")
 
 @bot.command()
 async def info(ctx):
-    text = (
-        "📝 **Dostępne komendy:**\n"
-        "`!status` - Sprawdza czy cache został zbudowany.\n"
-        "`!sprawdz` - Pokazuje domki dostępne do przejęcia z linkami do mapy.\n"
-        "`!info` - Pokazuje listę wszystkich komend i opis ich działania."
-    )
-    await ctx.send(text)
+    commands_info = """
+Lista komend bota:
+!status - Pokazuje ile domków jest w cache.
+!sprawdz - Pokazuje domki wolne lub z aktywnym graczem.
+!info - Pokazuje ten opis.
+"""
+    await ctx.send(commands_info)
 
-# ---------------- Run Bot ----------------
-if not TOKEN:
-    print("❌ Brak tokena! Ustaw DISCORD_TOKEN w zmiennych środowiskowych.")
-else:
-    bot.run(TOKEN)
+# ====== ALERT TASK ======
+@tasks.loop(minutes=5)
+async def alert_new_houses():
+    global cache
+    channel = bot.get_channel(DISCORD_CHANNEL)
+    if not channel:
+        print("❌ Nie znaleziono kanału do alertów")
+        return
+
+    houses = fetch_houses()
+    new_houses = []
+    for house in houses:
+        if all(house["name"] != c["name"] for c in cache):
+            new_houses.append(house)
+
+    for house in new_houses:
+        link = f" [📍]({house['map_link']})" if house["map_link"] else ""
+        await channel.send(f"⚠️ Nowy domek do przejęcia: {house['name']} - {house['size']} - {house['player']}{link}")
+
+    if new_houses:
+        cache.extend(new_houses)
+        save_cache_to_file()
+
+# ====== BOT EVENTS ======
+@bot.event
+async def on_ready():
+    print(f"✅ Zalogowano jako {bot.user}")
+    load_cache_from_file()
+    channel = bot.get_channel(DISCORD_CHANNEL)
+    await build_cache(ctx=channel)
+    alert_new_houses.start()
+
+# ====== RUN BOT ======
+bot.run(TOKEN)
