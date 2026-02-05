@@ -1,31 +1,36 @@
+# bot.py
+import os
 import discord
 from discord.ext import commands, tasks
 import requests
 from bs4 import BeautifulSoup
-import asyncio
-import json
 from datetime import datetime, timezone
+import json
+import asyncio
 
-TOKEN = "TWÓJ_DISCORD_TOKEN"
-GUILD_ID = 123456789012345678  # ID serwera Discord
-CHANNEL_ID = 123456789012345678  # Kanał, na którym bot będzie wysyłał alerty
-
-HOUSES_URL = "https://cyleria.pl/?subtopic=houses"
-HIGHSCORES_URL = "https://cyleria.pl/?subtopic=highscores"
+BASE_URL_HOUSES = "https://cyleria.pl/?subtopic=houses"
 CACHE_FILE = "cache.json"
-MIN_LEVEL = 600
+
+# Pobranie tokena z env variable
+TOKEN = os.environ.get("TOKEN")  # <-- w Railway ustaw zmienną środowiskową o nazwie TOKEN
+
+if not TOKEN:
+    raise ValueError("Nie ustawiono tokena bota! Ustaw zmienną środowiskową TOKEN na Railway.")
 
 intents = discord.Intents.default()
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 cache = {}
 
-# ------------------ pomocnicze funkcje ------------------
-
+# ------------------------
+# Funkcja do zapisu cache
 def save_cache():
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
+        json.dump(cache, f, ensure_ascii=False, indent=4)
 
+# ------------------------
+# Funkcja do wczytania cache
 def load_cache():
     global cache
     try:
@@ -34,118 +39,98 @@ def load_cache():
     except FileNotFoundError:
         cache = {}
 
-def parse_date(date_str):
-    try:
-        return datetime.strptime(date_str, "%d.%m.%Y (%H:%M)").replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
-
-def fetch_houses():
-    resp = requests.get(HOUSES_URL)
+# ------------------------
+# Funkcja pobierająca wszystkie domki
+def get_all_houses():
+    resp = requests.get(BASE_URL_HOUSES)
+    resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
-    houses_list = []
+    houses = []
 
-    rows = soup.select("table tr")[1:]  # pomijamy nagłówek
+    rows = soup.select("tr")
     for row in rows:
         cols = row.find_all("td")
-        if len(cols) < 4:
+        if not cols or len(cols) < 3:
             continue
-        address = cols[0].get_text(strip=True)
-        size = int(cols[1].get_text(strip=True))
-        player_name = cols[2].get_text(strip=True)
-        last_login_text = cols[3].get_text(strip=True)
-        last_login = parse_date(last_login_text)
-        houses_list.append({
-            "address": address,
-            "size": size,
-            "player": player_name,
-            "last_login": last_login
-        })
-    return houses_list
+        try:
+            house_name = cols[0].text.strip()
+            size = int(cols[1].text.strip())
+            player_name = cols[2].text.strip()
+            last_login_text = row.find(text=lambda t: "Logowanie:" in t)
+            if last_login_text:
+                last_login_str = last_login_text.split(":")[1].strip()
+                last_login = datetime.strptime(last_login_str, "%d.%m.%Y (%H:%M)")
+                last_login = last_login.replace(tzinfo=timezone.utc)
+            else:
+                last_login_str = None
 
-def fetch_players():
-    resp = requests.get(HIGHSCORES_URL)
-    soup = BeautifulSoup(resp.text, "html.parser")
-    players = {}
-    rows = soup.select("table tr")[1:]
-    for row in rows:
-        cols = row.find_all("td")
-        if len(cols) < 3:
+            houses.append({
+                "name": house_name,
+                "size": size,
+                "player": player_name,
+                "last_login": last_login_str
+            })
+        except Exception:
             continue
-        rank = int(cols[0].get_text(strip=True))
-        name = cols[1].get_text(strip=True)
-        level = int(cols[2].get_text(strip=True))
-        players[name] = level
-    return players
+    return houses
 
-async def build_cache(channel):
+# ------------------------
+# Funkcja do aktualizacji cache
+async def update_cache_channel(ctx=None):
     global cache
-    houses = fetch_houses()
-    players = fetch_players()
-    filtered = []
+    print("🔄 Rozpoczynam skan Cylerii...")
 
+    houses = get_all_houses()
     total = len(houses)
-    await channel.send(f"🔄 Rozpoczynam skan Cylerii... {total} domków do sprawdzenia.")
+    cache["houses"] = []
 
     for i, house in enumerate(houses, start=1):
-        player_name = house["player"]
-        level = players.get(player_name, 0)
-        if level >= MIN_LEVEL:
-            filtered.append(house)
-        # Pasek postępu
-        progress = int((i / total) * 20)
-        bar = "█" * progress + "-" * (20 - progress)
-        await channel.send(f"`[{bar}] {i}/{total}`", delete_after=3)  # krótko pokazuje pasek
-        await asyncio.sleep(0.1)  # delikatne opóźnienie, żeby nie spamować serwera
+        cache["houses"].append(house)
+        progress = (i / total) * 100
+        print(f"Budowanie cache: {i}/{total} ({progress:.1f}%)", end="\r")
+        await asyncio.sleep(0)
 
-    cache = {"houses": filtered, "timestamp": datetime.utcnow().isoformat()}
     save_cache()
-    await channel.send(f"✅ Skan zakończony! Znaleziono {len(filtered)} domków spełniających kryteria.")
+    print("\n✅ Cache gotowy –", total, "domków.")
 
-# ------------------ komendy ------------------
+    if ctx:
+        await ctx.send(f"✅ Cache zaktualizowany – {total} domków.")
 
-@bot.command()
-async def status(ctx):
-    if not cache.get("houses"):
-        await ctx.send("Cache nie był jeszcze budowany.")
-        return
-    ts = cache.get("timestamp", "brak")
-    await ctx.send(f"Cache ostatnio budowany: {ts}, liczba domków w cache: {len(cache['houses'])}")
-
+# ------------------------
+# Komenda sprawdzająca cache
 @bot.command()
 async def sprawdz(ctx):
-    if not cache.get("houses"):
+    load_cache()
+    houses = cache.get("houses", [])
+    if not houses:
         await ctx.send("Cache nie był jeszcze budowany.")
         return
-    lines = []
-    for house in cache["houses"]:
-        login_str = house["last_login"].strftime("%d.%m.%Y (%H:%M)") if house["last_login"] else "brak"
-        lines.append(f"{house['address']}  {house['size']}  {house['player']}  {login_str}")
-    msg = "```" + "\n".join(lines[:50]) + "```"  # max 50 wierszy
+
+    msg = "🏠 Domki w cache:\n"
+    for h in houses:
+        msg += f"{h['name']} | {h['size']} | {h['player']} | {h['last_login']}\n"
     await ctx.send(msg)
 
+# ------------------------
+# Komenda pokazująca status cache
 @bot.command()
-async def ultra(ctx):
-    if not cache.get("houses"):
+async def status(ctx):
+    load_cache()
+    houses = cache.get("houses", [])
+    if not houses:
         await ctx.send("Cache nie był jeszcze budowany.")
-        return
-    lines = []
-    for house in cache["houses"]:
-        login = house["last_login"]
-        days_offline = (datetime.now(timezone.utc) - login).days if login else 0
-        if days_offline >= 10:
-            lines.append(f"{house['address']}  {house['size']}  {house['player']}  {login.strftime('%d.%m.%Y (%H:%M)')}")
-    msg = "```" + "\n".join(lines[:50]) + "```"
-    await ctx.send(msg)
+    else:
+        await ctx.send(f"✅ Cache gotowy – {len(houses)} domków.")
 
-# ------------------ start bota ------------------
-
+# ------------------------
+# Automatyczne budowanie cache przy starcie
 @bot.event
 async def on_ready():
     print(f"Zalogowano jako {bot.user}")
-    load_cache()
-    channel = bot.get_channel(CHANNEL_ID)
-    if channel:
-        await build_cache(channel)
+    channel = None
+    # channel = bot.get_channel(ID_KANAŁU)
+    await update_cache_channel(ctx=channel)
 
+# ------------------------
+# Start bota
 bot.run(TOKEN)
