@@ -178,6 +178,15 @@ async def cycle_scan_alerts():
         await alert_new_houses()
 
 
-cycle_scan_alerts.start()
+@bot.event
+async def on_ready():
+    print(f"{bot.user} zalogowany")
+    channel = bot.get_channel(DISCORD_CHANNEL)
+    await build_cache(ctx=channel)
+    
+    # Startujemy cykliczny skaner dopiero po starcie bota
+    if not cycle_scan_alerts.is_running():
+        cycle_scan_alerts.start()
+
 
 bot.run(TOKEN)
