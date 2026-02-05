@@ -5,10 +5,12 @@ from datetime import datetime, timezone
 import requests
 from bs4 import BeautifulSoup
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 
-# Pobieranie tokena z Railway environment variables
+# Pobieranie tokena i kanału z Railway environment variables
 TOKEN = os.environ.get("DISCORD_TOKEN")
+CHANNEL_ID = int(os.environ.get("DISCORD_CHANNEL_ID", 0))
+
 if not TOKEN:
     raise ValueError("Token bota nie został ustawiony w Railway variables jako DISCORD_TOKEN")
 
@@ -19,7 +21,7 @@ CACHE_FILE = "cache.json"
 MIN_LEVEL = 600
 
 intents = discord.Intents.default()
-intents.message_content = True  # pozwala na komendy
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 cache = []
@@ -54,12 +56,18 @@ def fetch_houses():
         if len(cells) < 4:
             continue
         name = cells[0].get_text(strip=True)
+
+        # Pobranie linku do mapy (pinezka)
+        link_tag = cells[0].find("a")
+        link = link_tag['href'] if link_tag else None
+
         size = int(cells[1].get_text(strip=True))
         player = cells[2].get_text(strip=True)
         login_text = cells[3].get_text(strip=True)
         last_login = parse_login_date(login_text.replace("Logowanie:", "").strip())
         houses.append({
             "name": name,
+            "link": link,
             "size": size,
             "player": player,
             "last_login": login_text,
@@ -97,11 +105,11 @@ async def build_cache(ctx=None):
             cache.append(house)
 
         done += 1
-        # Pasek postępu
+        # Pasek postępu w konsoli
         progress = int(progress_bar_length * done / total)
         bar = "█" * progress + "-" * (progress_bar_length - progress)
         print(f"[{bar}] {done}/{total} domków", end="\r")
-        await asyncio.sleep(0.1)  # żeby nie blokować event loop
+        await asyncio.sleep(0.1)
 
     print("\n✅ Cache gotowy –", len(cache), "domków spełniających kryteria")
     save_cache()
@@ -109,14 +117,16 @@ async def build_cache(ctx=None):
     # Alert w kanale Discord
     if ctx and len(cache) > 0:
         msg = "⚠️ Są domki do przejęcia!\n"
-        msg += "\n".join([f"{h['name']} ({h['player']})" for h in cache])
+        for h in cache:
+            link_text = f" [Mapa]({h['link']})" if h['link'] else ""
+            msg += f"{h['name']} ({h['player']}){link_text} - Logowanie: {h['last_login']}\n"
         await ctx.send(msg)
 
 # --------- EVENTY ---------
 @bot.event
 async def on_ready():
     print(f"Zalogowano jako {bot.user}")
-    channel = bot.get_channel(int(os.environ.get("DISCORD_CHANNEL_ID", 0)))
+    channel = bot.get_channel(CHANNEL_ID)
     if channel:
         await build_cache(ctx=channel)
 
@@ -128,7 +138,8 @@ async def sprawdz(ctx):
         return
     msg = "🏠 Domki spełniające kryteria:\n"
     for house in cache:
-        msg += f"{house['name']} ({house['player']}) - Logowanie: {house['last_login']}\n"
+        link_text = f" [Mapa]({house['link']})" if house['link'] else ""
+        msg += f"{house['name']} ({house['player']}){link_text} - Logowanie: {house['last_login']}\n"
     await ctx.send(msg)
 
 @bot.command()
