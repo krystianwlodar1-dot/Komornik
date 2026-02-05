@@ -1,139 +1,218 @@
-import os
-import asyncio
-from datetime import datetime, timezone
 import discord
 from discord.ext import commands, tasks
 import requests
 from bs4 import BeautifulSoup
+from datetime import datetime, timezone
+import json
+import asyncio
 
-# Discord intents
+TOKEN = "TU_WKLEJ_TOKEN"  # Twój token
+CACHE_FILE = "cache.json"
+ALERT_CHANNEL = "general"  # nazwa kanału, na który wysyła alerty
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Cache domków
 house_cache = {}
-cache_building = False
-cache_progress_msg = None
 
-CYLERIA_HOUSES_URL = "https://cyleria.pl/?subtopic=houses"
+# -------------------
+# Funkcje pomocnicze
+# -------------------
 
-# Minimalny poziom postaci
-MIN_LEVEL = 600
+def save_cache():
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(house_cache, f, ensure_ascii=False, indent=2)
 
-# Funkcja do pobrania listy domków i właścicieli
+def load_cache():
+    global house_cache
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            house_cache = json.load(f)
+    except FileNotFoundError:
+        house_cache = {}
+
+def parse_last_login(login_str):
+    try:
+        return datetime.strptime(login_str, "%d.%m.%Y (%H:%M)").replace(tzinfo=timezone.utc)
+    except:
+        return None
+
 def fetch_houses():
-    houses = []
-    resp = requests.get(CYLERIA_HOUSES_URL)
+    url = "https://cyleria.pl/?subtopic=houses"
+    resp = requests.get(url)
     soup = BeautifulSoup(resp.text, "html.parser")
-    table_rows = soup.find_all("tr")[1:]  # pomijamy nagłówek
+    houses = {}
 
-    for row in table_rows:
+    table = soup.find("table")
+    if not table:
+        return houses
+
+    rows = table.find_all("tr")[1:]  # pomijamy nagłówek
+    for row in rows:
         cols = row.find_all("td")
         if len(cols) < 4:
             continue
-        house_name = cols[0].text.strip()
+        name = cols[0].text.strip()
         size = cols[1].text.strip()
-        owner = cols[2].text.strip()
-        last_login_str = cols[3].text.strip()
-        if owner.lower() == "brak":
-            continue
-        try:
-            last_login = datetime.strptime(last_login_str, "%d.%m.%Y (%H:%M)").replace(tzinfo=timezone.utc)
-        except:
-            last_login = None
-        houses.append({
-            "name": house_name,
+        player = cols[2].text.strip()
+        map_link_tag = cols[0].find("a")
+        map_link = map_link_tag["href"] if map_link_tag else ""
+        houses[name] = {
+            "name": name,
             "size": size,
-            "owner": owner,
-            "last_login": last_login
-        })
+            "player": player,
+            "map": map_link,
+            "last_login": None,
+            "level": None
+        }
     return houses
 
-# Funkcja budująca cache z paskiem postępu i ETA
-async def build_cache(channel):
-    global house_cache, cache_building, cache_progress_msg
-    cache_building = True
-    house_cache = {}
-    houses = fetch_houses()
-    total = len(houses)
-    start_time = datetime.now(timezone.utc)
+def fetch_player_info(player_name):
+    url = f"https://cyleria.pl/?subtopic=characters&name={player_name}"
+    resp = requests.get(url)
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    cache_progress_msg = await channel.send(f"🔄 Rozpoczynam skan Cylerii... 0/{total}")
-    for i, house in enumerate(houses, 1):
-        house_cache[house["name"]] = house
+    # Parsowanie poziomu
+    level = None
+    table = soup.find("table")
+    if table:
+        for row in table.find_all("tr"):
+            if "Level" in row.text:
+                level_text = row.find_all("td")[1].text.strip()
+                level = int(level_text)
+                break
 
-        elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
-        eta = int(elapsed / i * (total - i)) if i > 0 else 0
-        await cache_progress_msg.edit(content=f"🔄 Skanuję domki... {i}/{total} ETA: ~{eta}s")
-        await asyncio.sleep(0.1)  # sztuczne opóźnienie, żeby Discord nie spamił
+    # Parsowanie ostatniego logowania
+    last_login = None
+    for row in soup.find_all("tr"):
+        if "Logowanie" in row.text:
+            last_login_str = row.find("td").text.strip()
+            last_login = parse_last_login(last_login_str)
+            break
+    return level, last_login
 
-    cache_building = False
-    await cache_progress_msg.edit(content=f"✅ Cache gotowy – {len(house_cache)} domków.")
-    await channel.send("🚨 Skan zakończony!")
+async def update_cache_channel(channel=None):
+    global house_cache
+    house_cache = fetch_houses()
+    total = len(house_cache)
+    count = 0
 
+    progress_msg = None
+    if channel:
+        progress_msg = await channel.send("🔄 Rozpoczynam skan Cylerii...")
+
+    for house in house_cache.values():
+        player_name = house["player"]
+        if player_name:
+            level, last_login = fetch_player_info(player_name)
+            house["level"] = level
+            if last_login:
+                house["last_login"] = last_login.isoformat()
+        count += 1
+        # Pasek postępu
+        if channel and progress_msg:
+            percent = int(count / total * 100)
+            bar = "█" * (percent // 5) + "-" * (20 - percent // 5)
+            await progress_msg.edit(content=f"🔄 Skanuję domki: |{bar}| {percent}% ({count}/{total})")
+        await asyncio.sleep(0.1)  # lekka przerwa, żeby Discord nie blokował
+    save_cache()
+    if channel and progress_msg:
+        await progress_msg.edit(content=f"✅ Cache gotowy – {len(house_cache)} domków.")
+
+    # Alert dla domków 13+ dni offline
+    if channel:
+        now = datetime.now(timezone.utc)
+        alert_count = 0
+        alert_msg = ""
+        for h in house_cache.values():
+            last_login = h.get("last_login")
+            if not last_login:
+                continue
+            last_login_dt = datetime.fromisoformat(last_login)
+            offline_days = (now - last_login_dt).days
+            if offline_days >= 13:
+                alert_msg += f"⚠ {h['name']} – {h['player']} – {offline_days} dni offline – [mapa]({h['map']})\n"
+                alert_count += 1
+        if alert_count > 0:
+            await channel.send(f"🚨 Alert! {alert_count} domków 13+ dni offline:\n{alert_msg}")
+
+# -------------------
 # Komendy
+# -------------------
+
+@bot.command()
+async def info(ctx):
+    msg = ("⚙ Komendy bota:\n"
+           "!info – pokazuje dostępne komendy\n"
+           "!sprawdz – wszystkie domki 10+ dni offline\n"
+           "!ultra – tylko domki 10+ dni offline i właściciele 600+\n"
+           "!status – pokazuje status cache")
+    await ctx.send(msg)
+
 @bot.command()
 async def status(ctx):
-    if cache_building:
-        await ctx.send("🔄 Cache jest w trakcie budowy...")
+    if not house_cache:
+        await ctx.send("⚠ Cache nie był jeszcze budowany.")
     else:
-        await ctx.send(f"✅ Cache gotowy – {len(house_cache)} domków.")
+        await ctx.send(f"✅ Cache gotowy – {len(house_cache)} domków zapisanych.")
 
 @bot.command()
 async def sprawdz(ctx):
-    if cache_building:
-        await ctx.send("🔄 Cache jest w trakcie budowy...")
+    if not house_cache:
+        await ctx.send("⚠ Cache nie był jeszcze budowany.")
         return
-    result = []
     now = datetime.now(timezone.utc)
-    for house in house_cache.values():
-        if house["last_login"] is None:
+    msg = "🏠 Domki do przejęcia (10+ dni offline):\n"
+    count = 0
+    for h in house_cache.values():
+        last_login = h.get("last_login")
+        if not last_login:
             continue
-        offline_days = (now - house["last_login"]).days
+        last_login_dt = datetime.fromisoformat(last_login)
+        offline_days = (now - last_login_dt).days
         if offline_days >= 10:
-            result.append(f"{house['name']} – {house['owner']} – {offline_days} dni offline")
-    if not result:
-        await ctx.send("❌ Brak domków spełniających kryteria.")
-    else:
-        await ctx.send("\n".join(result[:20]))
+            msg += f"{h['name']} – {h['player']} – {offline_days} dni offline – [mapa]({h['map']})\n"
+            count += 1
+    if count == 0:
+        msg += "Brak domków spełniających warunki."
+    await ctx.send(msg)
 
 @bot.command()
 async def ultra(ctx):
-    if cache_building:
-        await ctx.send("🔄 Cache jest w trakcie budowy...")
+    if not house_cache:
+        await ctx.send("⚠ Cache nie był jeszcze budowany.")
         return
-    result = []
     now = datetime.now(timezone.utc)
-    for house in house_cache.values():
-        if house["last_login"] is None:
+    msg = "🏠 Ultra – domki 600+ i 10+ dni offline:\n"
+    count = 0
+    for h in house_cache.values():
+        last_login = h.get("last_login")
+        level = h.get("level") or 0
+        if not last_login:
             continue
-        offline_days = (now - house["last_login"]).days
-        # zakładamy, że minimalny poziom właściciela jest 600
-        # tu nie pobieramy poziomu z Highscores, więc traktujemy wszystkich
-        if offline_days >= 10:
-            result.append(f"{house['name']} – {house['owner']} – {offline_days} dni offline")
-    if not result:
-        await ctx.send("❌ Brak domków spełniających kryteria dla trybu ULTRA.")
-    else:
-        await ctx.send("\n".join(result[:20]))
+        last_login_dt = datetime.fromisoformat(last_login)
+        offline_days = (now - last_login_dt).days
+        if offline_days >= 10 and level >= 600:
+            msg += f"{h['name']} – {h['player']} ({level} lvl) – {offline_days} dni offline – [mapa]({h['map']})\n"
+            count += 1
+    if count == 0:
+        msg += "Brak domków spełniających warunki."
+    await ctx.send(msg)
+
+# -------------------
+# Eventy
+# -------------------
 
 @bot.event
 async def on_ready():
     print(f"Zalogowano jako {bot.user}")
-    channel_id = os.getenv("DISCORD_CHANNEL")  # ustaw ID kanału w zmiennej środowiskowej
-    if channel_id:
-        channel = bot.get_channel(int(channel_id))
-        if channel:
-            await build_cache(channel)
-        else:
-            print("Nie znaleziono kanału!")
-    else:
-        print("Nie ustawiono DISCORD_CHANNEL w zmiennych środowiskowych!")
+    load_cache()
+    channel = discord.utils.get(bot.get_all_channels(), name=ALERT_CHANNEL)
+    if channel:
+        await update_cache_channel(channel=channel)
 
-# Uruchomienie bota
-TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
-    print("❌ Nie ustawiono DISCORD_TOKEN w zmiennych środowiskowych!")
-else:
-    bot.run(TOKEN)
+# -------------------
+# Start bota
+# -------------------
+bot.run(TOKEN)
