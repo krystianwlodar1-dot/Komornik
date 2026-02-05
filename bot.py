@@ -4,223 +4,181 @@ import asyncio
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
-import discord
 from discord.ext import commands, tasks
-import time
+import discord
 
-# -------------------- CONFIG --------------------
-TOKEN = os.environ.get("DISCORD_TOKEN")
-DISCORD_CHANNEL = int(os.environ.get("DISCORD_CHANNEL", 0))
+# ------------------- Variables -------------------
+TOKEN = os.getenv("DISCORD_TOKEN")
+DISCORD_CHANNEL = int(os.getenv("DISCORD_CHANNEL"))
 
 BASE_HOUSES_URL = "https://cyleria.pl/?subtopic=houses"
-BASE_PLAYERS_URL = "https://cyleria.pl/?subtopic=highscores&player="
+BASE_PLAYERS_URL = "https://cyleria.pl/?subtopic=characters&name="
 
-CACHE_FILE = "house_cache.json"
-MIN_DAYS_ABSENCE = 10
-ALERT_12_DAYS = 12
-ALERT_4H_BEFORE = ALERT_12_DAYS * 24 - 4  # w godzinach (4h przed 14 dniem nieobecności)
+CACHE_FILE = "cache.json"
+MIN_INACTIVE_DAYS = 10
 
-# -------------------- BOT --------------------
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
+cache = []
 
-house_cache = []
-alerted_10d = set()
-alerted_12d = set()
-alerted_4h = set()
-
-# -------------------- FETCHING FUNCTIONS --------------------
+# ------------------- Helpers -------------------
 def fetch_houses():
     resp = requests.get(BASE_HOUSES_URL)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
     houses = []
-
-    rows = soup.select("table tr")[1:]  # pomijamy nagłówek
-    for row in rows:
+    for row in soup.find_all("tr")[1:]:
         cells = row.find_all("td")
-        if len(cells) < 3:
+        if len(cells) < 4:
             continue
-        house_name = cells[0].get_text(strip=True)
-        size_text = cells[1].get_text(strip=True)
-        owner = cells[2].get_text(strip=True)
-
         try:
-            size = int(size_text)
-        except ValueError:
-            size = None
-
+            house_name = cells[0].get_text(strip=True)
+            size = int(cells[1].get_text(strip=True))
+            owner = cells[2].get_text(strip=True)
+            link_map = cells[0].find("a")["href"] if cells[0].find("a") else None
+        except Exception:
+            continue
         houses.append({
-            "name": house_name,
+            "house": house_name,
             "size": size,
-            "owner": owner if owner else None,
-            "link": f"https://cyleria.pl/?subtopic=houses&row={house_name.replace(' ', '%20')}",
-            "last_login": None
+            "owner": owner,
+            "link": link_map
         })
     return houses
 
 def fetch_last_login(player_name):
+    if not player_name or player_name.lower() == "brak":
+        return None
     url = BASE_PLAYERS_URL + player_name
-    resp = requests.get(url)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-    login_text_elem = soup.find(string=lambda s: s and "Logowanie:" in s)
-    if login_text_elem:
-        try:
-            login_text = login_text_elem.split("Logowanie:")[-1].strip()
-            last_login = datetime.strptime(login_text, "%d.%m.%Y (%H:%M)")
-            return last_login.replace(tzinfo=timezone.utc)
-        except ValueError:
+    try:
+        resp = requests.get(url)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        login_elem = soup.find(string=lambda s: s and "Logowanie:" in s)
+        if not login_elem:
             return None
-    return None
+        parent = login_elem.parent
+        login_text = None
+        if parent and parent.next_sibling:
+            login_text = parent.next_sibling.get_text(strip=True)
+        if not login_text:
+            login_text = login_elem.split("Logowanie:")[-1].strip()
+        last_login = datetime.strptime(login_text, "%d.%m.%Y (%H:%M)")
+        return last_login.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
-# -------------------- CACHE BUILDING --------------------
-async def build_cache(channel=None):
-    global house_cache
+def save_cache():
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+def load_cache():
+    global cache
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+
+# ------------------- Cache Building -------------------
+async def build_cache(ctx=None):
+    global cache
     houses = fetch_houses()
     total = len(houses)
-    start_time = time.time()
+    cache.clear()
 
-    progress_message = None
-    if channel:
-        progress_message = await channel.send(f"🔄 Budowanie cache: 0/{total} (0s pozostało)")
+    if ctx:
+        progress_msg = await ctx.send(f"Budowanie cache: 0/{total}")
+    else:
+        progress_msg = None
 
-    for i, house in enumerate(houses, 1):
-        if house["owner"]:
-            last_login = fetch_last_login(house["owner"])
-            house["last_login"] = last_login
+    for idx, h in enumerate(houses, 1):
+        last_login = fetch_last_login(h["owner"])
+        h["last_login"] = last_login.isoformat() if last_login else None
+        cache.append(h)
 
-        if progress_message:
-            elapsed = time.time() - start_time
-            if i > 0:
-                remaining = elapsed / i * (total - i)
-            else:
-                remaining = 0
-            mins, secs = divmod(int(remaining), 60)
-            bar = f"[{'█' * int(i/total*20):20}] {i}/{total}"
-            await progress_message.edit(
-                content=f"🔄 Budowanie cache: {bar} (pozostało ~{mins}m {secs}s)"
-            )
+        if progress_msg:
+            await progress_msg.edit(content=f"Budowanie cache: {idx}/{total}")
 
-    house_cache = houses
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump([h for h in house_cache], f, default=str, ensure_ascii=False)
+        await asyncio.sleep(0.1)  # delikatny throttle, nie spamować serwera
 
-    if channel:
-        await channel.send(f"✅ Cache zbudowany. Znaleziono {len(house_cache)} domków.")
+    save_cache()
+    if ctx:
+        await progress_msg.edit(content=f"✅ Cache zbudowany. Znaleziono {len(cache)} domków.")
+    else:
+        print(f"✅ Cache zbudowany. Znaleziono {len(cache)} domków.")
 
-# -------------------- ALERT LOGIC --------------------
-async def alert_houses(channel):
-    if not house_cache:
-        return
-
+# ------------------- Alerts -------------------
+async def send_alerts():
+    channel = bot.get_channel(DISCORD_CHANNEL)
     now = datetime.now(timezone.utc)
-    for house in house_cache:
-        last_login = house.get("last_login")
-        if not last_login or not house["owner"]:
+    for h in cache:
+        if not h.get("last_login"):
             continue
+        last_login = datetime.fromisoformat(h["last_login"])
+        days_inactive = (now - last_login).days
+        hours_inactive = (now - last_login).total_seconds() / 3600
 
-        days_absent = (now - last_login).days
-        hours_absent = (now - last_login).total_seconds() / 3600
+        # Alert dla 12 dni
+        if days_inactive == 12:
+            text = f"⚠️ Domek `{h['house']}` właściciela `{h['owner']}` nieaktywny 12 dni! Mapka: {h['link']}"
+            await channel.send(text)
 
-        # 10 dni nieobecności
-        if days_absent >= MIN_DAYS_ABSENCE and house["name"] not in alerted_10d:
-            await channel.send(
-                f"🏠 Domek do przejęcia: {house['name']} ({house['size']})\n"
-                f"Właściciel: {house['owner']}\n"
-                f"Ostatnie logowanie: {house['last_login'].strftime('%d.%m.%Y (%H:%M)')}\n"
-                f"Mapa: {house['link']}"
-            )
-            alerted_10d.add(house["name"])
+        # Alert 4h przed przejęciem (14 dni)
+        if 336 <= hours_inactive < 340:  # 336 = 14*24 - 4
+            text = f"⏰ Domek `{h['house']}` właściciela `{h['owner']}` za 4h do przejęcia! Mapka: {h['link']}"
+            await channel.send(text)
 
-        # 12 dni nieobecności
-        if days_absent >= ALERT_12_DAYS and house["name"] not in alerted_12d:
-            await channel.send(
-                f"⚠️ 12 dni nieobecności: {house['name']} ({house['size']}) "
-                f"- właściciel: {house['owner']}\nMapa: {house['link']}"
-            )
-            alerted_12d.add(house["name"])
-
-        # 4 godziny przed przejęciem (czyli 14 dni nieobecności)
-        if ALERT_4H_BEFORE <= hours_absent < ALERT_4H_BEFORE + 1 and house["name"] not in alerted_4h:
-            await channel.send(
-                f"⏰ 4h do przejęcia domku: {house['name']} ({house['size']})\n"
-                f"Właściciel: {house['owner']}\nMapa: {house['link']}"
-            )
-            alerted_4h.add(house["name"])
-
-# -------------------- DISCORD COMMANDS --------------------
-def build_progress_bar(current, total, length=20):
-    filled = int(current/total * length)
-    return f"[{'█'*filled}{'-'*(length-filled)}] {current}/{total}"
-
+# ------------------- Bot Commands -------------------
 @bot.command()
 async def sprawdz(ctx):
-    if not house_cache:
-        await ctx.send("⚠️ Cache nie był jeszcze budowany!")
+    now = datetime.now(timezone.utc)
+    result = []
+    for h in cache:
+        if not h.get("last_login"):
+            continue
+        last_login = datetime.fromisoformat(h["last_login"])
+        if (now - last_login).days >= MIN_INACTIVE_DAYS:
+            result.append(f"{h['house']} ({h['owner']}) - {h['link']}")
+
+    if not result:
+        await ctx.send("Brak domków spełniających kryteria.")
         return
 
-    text = ""
-    now = datetime.now(timezone.utc)
-    total = len(house_cache)
-    progress_msg = await ctx.send(f"🔄 Sprawdzanie domków: {build_progress_bar(0,total)} (0s pozostało)")
-
-    start_time = time.time()
-    for i, house in enumerate(house_cache, 1):
-        last_login = house.get("last_login")
-        if last_login:
-            days_absent = (now - last_login).days
-            if days_absent >= MIN_DAYS_ABSENCE:
-                text += f"{house['name']} ({house['size']}) - {house['owner']} - {days_absent} dni nieobecności\nMapa: {house['link']}\n\n"
-
-        # update progress and remaining time
-        if i % 2 == 0 or i == total:
-            elapsed = time.time() - start_time
-            remaining = elapsed / i * (total - i) if i > 0 else 0
-            mins, secs = divmod(int(remaining), 60)
-            await progress_msg.edit(
-                content=f"🔄 Sprawdzanie domków: {build_progress_bar(i,total)} (pozostało ~{mins}m {secs}s)"
-            )
-
-    if not text:
-        text = "Brak domków spełniających kryteria."
-    for i in range(0, len(text), 4000):
-        await ctx.send(text[i:i+4000])
+    # Rozbij na wiadomości po 1900 znaków
+    msg = ""
+    for line in result:
+        if len(msg) + len(line) + 1 > 1900:
+            await ctx.send(msg)
+            msg = ""
+        msg += line + "\n"
+    if msg:
+        await ctx.send(msg)
 
 @bot.command()
 async def status(ctx):
-    if not house_cache:
-        await ctx.send("⚠️ Cache nie był jeszcze budowany!")
-        return
-    await ctx.send(f"✅ Cache gotowy. Znaleziono {len(house_cache)} domków.")
+    await ctx.send(f"Cache zawiera {len(cache)} domków.")
 
 @bot.command()
 async def info(ctx):
-    cmds = """
-**Dostępne komendy:**
-!sprawdz - sprawdza domki do przejęcia (min. 10 dni nieobecności)
-!status - pokazuje status cache
-!info - pokazuje listę komend
-"""
-    await ctx.send(cmds)
+    text = (
+        "**Dostępne komendy:**\n"
+        "`!sprawdz` - pokaż domki, których właściciel nie logował się >10 dni\n"
+        "`!status` - pokaż ile domków jest w cache\n"
+        "`!info` - pokaż tę wiadomość\n"
+    )
+    await ctx.send(text)
 
-# -------------------- BACKGROUND TASK --------------------
-@tasks.loop(hours=1)
-async def background_scan():
-    channel = bot.get_channel(DISCORD_CHANNEL)
-    if channel:
-        await build_cache(channel)
-        await alert_houses(channel)
+# ------------------- Background Tasks -------------------
+@tasks.loop(minutes=60)
+async def background_alerts():
+    await send_alerts()
 
-# -------------------- BOT EVENTS --------------------
+# ------------------- Bot Events -------------------
 @bot.event
 async def on_ready():
-    print(f"Bot zalogowany jako {bot.user}")
-    channel = bot.get_channel(DISCORD_CHANNEL)
-    await build_cache(channel)
-    await alert_houses(channel)
-    background_scan.start()
+    print(f"Zalogowano jako {bot.user}")
+    load_cache()
+    # Buduj cache przy starcie
+    await build_cache()
+    background_alerts.start()
 
-# -------------------- RUN BOT --------------------
+# ------------------- Run Bot -------------------
 bot.run(TOKEN)
