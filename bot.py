@@ -17,7 +17,7 @@ BASE_PLAYERS_URL = "https://cyleria.pl/?subtopic=highscores&player="
 CACHE_FILE = "house_cache.json"
 MIN_DAYS_ABSENCE = 10
 ALERT_12_DAYS = 12
-ALERT_4H_BEFORE = ALERT_12_DAYS * 24 - 4  # w godzinach
+ALERT_4H_BEFORE = ALERT_12_DAYS * 24 - 4  # w godzinach (4h przed 14 dniem)
 
 # -------------------- BOT --------------------
 intents = discord.Intents.default()
@@ -25,6 +25,9 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 house_cache = []
+alerted_10d = set()
+alerted_12d = set()
+alerted_4h = set()
 
 # -------------------- FETCHING FUNCTIONS --------------------
 def fetch_houses():
@@ -76,8 +79,8 @@ async def build_cache(channel=None):
     global house_cache
     houses = fetch_houses()
     total = len(houses)
-    progress_message = None
 
+    progress_message = None
     if channel:
         progress_message = await channel.send(f"🔄 Budowanie cache: 0/{total}")
 
@@ -86,7 +89,8 @@ async def build_cache(channel=None):
             last_login = fetch_last_login(house["owner"])
             house["last_login"] = last_login
         if progress_message:
-            await progress_message.edit(content=f"🔄 Budowanie cache: {i}/{total}")
+            bar = f"[{'█' * int(i/total*20):20}] {i}/{total}"
+            await progress_message.edit(content=f"🔄 Budowanie cache: {bar}")
 
     house_cache = houses
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
@@ -96,54 +100,73 @@ async def build_cache(channel=None):
         await channel.send(f"✅ Cache zbudowany. Znaleziono {len(house_cache)} domków.")
 
 # -------------------- ALERT LOGIC --------------------
-async def alert_new_houses(channel):
+async def alert_houses(channel):
     if not house_cache:
         return
-
-    # wczytaj poprzedni cache, jeśli istnieje
-    previous = []
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            previous = json.load(f)
-
-    previous_names = {h["name"] for h in previous}
-    new_houses = []
 
     now = datetime.now(timezone.utc)
     for house in house_cache:
         last_login = house.get("last_login")
-        if last_login and house["name"] not in previous_names:
-            days_absent = (now - last_login).days
-            if days_absent >= MIN_DAYS_ABSENCE:
-                new_houses.append(house)
+        if not last_login or not house["owner"]:
+            continue
 
-    for house in new_houses:
-        await channel.send(
-            f"🏠 Nowy domek do przejęcia: {house['name']} ({house['size']}), "
-            f"Właściciel: {house['owner']}, Ostatnie logowanie: {house['last_login'].strftime('%d.%m.%Y (%H:%M)')}\n"
-            f"Mapa: {house['link']}"
-        )
+        days_absent = (now - last_login).days
+        hours_absent = (now - last_login).total_seconds() / 3600
+
+        # 10 dni nieobecności
+        if days_absent >= MIN_DAYS_ABSENCE and house["name"] not in alerted_10d:
+            await channel.send(
+                f"🏠 Domek do przejęcia: {house['name']} ({house['size']})\n"
+                f"Właściciel: {house['owner']}\n"
+                f"Ostatnie logowanie: {house['last_login'].strftime('%d.%m.%Y (%H:%M)')}\n"
+                f"Mapa: {house['link']}"
+            )
+            alerted_10d.add(house["name"])
+
+        # 12 dni nieobecności
+        if days_absent >= ALERT_12_DAYS and house["name"] not in alerted_12d:
+            await channel.send(
+                f"⚠️ 12 dni nieobecności: {house['name']} ({house['size']}) "
+                f"- właściciel: {house['owner']}\nMapa: {house['link']}"
+            )
+            alerted_12d.add(house["name"])
+
+        # 4 godziny przed przejęciem (czyli 14 dni nieobecności)
+        if ALERT_4H_BEFORE <= hours_absent < ALERT_4H_BEFORE + 1 and house["name"] not in alerted_4h:
+            await channel.send(
+                f"⏰ 4h do przejęcia domku: {house['name']} ({house['size']})\n"
+                f"Właściciel: {house['owner']}\nMapa: {house['link']}"
+            )
+            alerted_4h.add(house["name"])
 
 # -------------------- DISCORD COMMANDS --------------------
+def build_progress_bar(current, total, length=20):
+    filled = int(current/total * length)
+    return f"[{'█'*filled}{'-'*(length-filled)}] {current}/{total}"
+
 @bot.command()
 async def sprawdz(ctx):
     if not house_cache:
         await ctx.send("⚠️ Cache nie był jeszcze budowany!")
         return
 
-    now = datetime.now(timezone.utc)
     text = ""
-    for house in house_cache:
+    now = datetime.now(timezone.utc)
+    total = len(house_cache)
+    progress_msg = await ctx.send(f"🔄 Sprawdzanie domków: {build_progress_bar(0,total)}")
+
+    for i, house in enumerate(house_cache, 1):
         last_login = house.get("last_login")
         if last_login:
             days_absent = (now - last_login).days
             if days_absent >= MIN_DAYS_ABSENCE:
                 text += f"{house['name']} ({house['size']}) - {house['owner']} - {days_absent} dni nieobecności\nMapa: {house['link']}\n\n"
 
+        if i % 2 == 0 or i == total:  # edytuj co 2 domki żeby nie spamić
+            await progress_msg.edit(content=f"🔄 Sprawdzanie domków: {build_progress_bar(i,total)}")
+
     if not text:
         text = "Brak domków spełniających kryteria."
-
-    # Discord ma limit 4000 znaków na wiadomość
     for i in range(0, len(text), 4000):
         await ctx.send(text[i:i+4000])
 
@@ -160,7 +183,7 @@ async def info(ctx):
 **Dostępne komendy:**
 !sprawdz - sprawdza domki do przejęcia (min. 10 dni nieobecności)
 !status - pokazuje status cache
-!info - pokazuje tę wiadomość z listą komend
+!info - pokazuje listę komend
 """
     await ctx.send(cmds)
 
@@ -170,7 +193,7 @@ async def background_scan():
     channel = bot.get_channel(DISCORD_CHANNEL)
     if channel:
         await build_cache(channel)
-        await alert_new_houses(channel)
+        await alert_houses(channel)
 
 # -------------------- BOT EVENTS --------------------
 @bot.event
@@ -178,7 +201,7 @@ async def on_ready():
     print(f"Bot zalogowany jako {bot.user}")
     channel = bot.get_channel(DISCORD_CHANNEL)
     await build_cache(channel)
-    await alert_new_houses(channel)
+    await alert_houses(channel)
     background_scan.start()
 
 # -------------------- RUN BOT --------------------
