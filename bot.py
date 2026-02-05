@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 import discord
 from discord.ext import commands, tasks
+import time
 
 # -------------------- CONFIG --------------------
 TOKEN = os.environ.get("DISCORD_TOKEN")
@@ -17,7 +18,7 @@ BASE_PLAYERS_URL = "https://cyleria.pl/?subtopic=highscores&player="
 CACHE_FILE = "house_cache.json"
 MIN_DAYS_ABSENCE = 10
 ALERT_12_DAYS = 12
-ALERT_4H_BEFORE = ALERT_12_DAYS * 24 - 4  # w godzinach (4h przed 14 dniem)
+ALERT_4H_BEFORE = ALERT_12_DAYS * 24 - 4  # w godzinach (4h przed 14 dniem nieobecności)
 
 # -------------------- BOT --------------------
 intents = discord.Intents.default()
@@ -79,18 +80,28 @@ async def build_cache(channel=None):
     global house_cache
     houses = fetch_houses()
     total = len(houses)
+    start_time = time.time()
 
     progress_message = None
     if channel:
-        progress_message = await channel.send(f"🔄 Budowanie cache: 0/{total}")
+        progress_message = await channel.send(f"🔄 Budowanie cache: 0/{total} (0s pozostało)")
 
     for i, house in enumerate(houses, 1):
         if house["owner"]:
             last_login = fetch_last_login(house["owner"])
             house["last_login"] = last_login
+
         if progress_message:
+            elapsed = time.time() - start_time
+            if i > 0:
+                remaining = elapsed / i * (total - i)
+            else:
+                remaining = 0
+            mins, secs = divmod(int(remaining), 60)
             bar = f"[{'█' * int(i/total*20):20}] {i}/{total}"
-            await progress_message.edit(content=f"🔄 Budowanie cache: {bar}")
+            await progress_message.edit(
+                content=f"🔄 Budowanie cache: {bar} (pozostało ~{mins}m {secs}s)"
+            )
 
     house_cache = houses
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
@@ -153,8 +164,9 @@ async def sprawdz(ctx):
     text = ""
     now = datetime.now(timezone.utc)
     total = len(house_cache)
-    progress_msg = await ctx.send(f"🔄 Sprawdzanie domków: {build_progress_bar(0,total)}")
+    progress_msg = await ctx.send(f"🔄 Sprawdzanie domków: {build_progress_bar(0,total)} (0s pozostało)")
 
+    start_time = time.time()
     for i, house in enumerate(house_cache, 1):
         last_login = house.get("last_login")
         if last_login:
@@ -162,8 +174,14 @@ async def sprawdz(ctx):
             if days_absent >= MIN_DAYS_ABSENCE:
                 text += f"{house['name']} ({house['size']}) - {house['owner']} - {days_absent} dni nieobecności\nMapa: {house['link']}\n\n"
 
-        if i % 2 == 0 or i == total:  # edytuj co 2 domki żeby nie spamić
-            await progress_msg.edit(content=f"🔄 Sprawdzanie domków: {build_progress_bar(i,total)}")
+        # update progress and remaining time
+        if i % 2 == 0 or i == total:
+            elapsed = time.time() - start_time
+            remaining = elapsed / i * (total - i) if i > 0 else 0
+            mins, secs = divmod(int(remaining), 60)
+            await progress_msg.edit(
+                content=f"🔄 Sprawdzanie domków: {build_progress_bar(i,total)} (pozostało ~{mins}m {secs}s)"
+            )
 
     if not text:
         text = "Brak domków spełniających kryteria."
