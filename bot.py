@@ -1,16 +1,17 @@
+import os
+import json
+import asyncio
+import requests
+from datetime import datetime, timezone
+from bs4 import BeautifulSoup
 import discord
 from discord.ext import commands, tasks
-import requests
-from bs4 import BeautifulSoup
-import json
-from datetime import datetime, timezone
-import os
 
-# --- VARIABLES FROM RAILWAY ENV ---
-TOKEN = os.getenv("DISCORD_TOKEN")
-DISCORD_CHANNEL = int(os.getenv("DISCORD_CHANNEL"))
+# --- VARIABLES from Railway ---
+TOKEN = os.getenv("TOKEN")  # Discord bot token
+DISCORD_CHANNEL = int(os.getenv("DISCORD_CHANNEL", "0"))
 
-# --- CONSTANTS ---
+# --- Constants ---
 HOUSES_URL = "https://cyleria.pl/?subtopic=houses"
 HIGHSCORES_URL = "https://cyleria.pl/?subtopic=highscores"
 CACHE_FILE = "cache.json"
@@ -22,95 +23,81 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 cache = []
 
-# --- UTILS ---
-def save_cache_to_file():
+# --- UTILITIES ---
+def save_cache():
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False, indent=2)
 
-def load_cache_from_file():
+def load_cache():
     global cache
     if os.path.exists(CACHE_FILE):
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             cache = json.load(f)
 
 def fetch_houses():
+    """Fetch houses from Cyleria.pl and return list of dicts."""
     resp = requests.get(HOUSES_URL)
-    resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
-    houses = []
+    houses_list = []
 
-    # przykładowa logika parsowania
-    table = soup.find("table")
-    if not table:
-        return houses
-
-    for row in table.find_all("tr")[1:]:
+    # Wyszukujemy wszystkie rzędy domków
+    rows = soup.select("table tbody tr")  # przyjmujemy tabelę domków
+    for row in rows:
         cells = row.find_all("td")
         if len(cells) < 4:
             continue
+        name_cell = cells[0]
+        name = name_cell.get_text(strip=True)
+        map_link_tag = name_cell.find("a")
+        map_link = map_link_tag['href'] if map_link_tag else ""
         try:
-            name = cells[0].get_text(strip=True)
             size = int(cells[1].get_text(strip=True))
-            owner = cells[2].get_text(strip=True)
-            last_login_str = cells[3].get_text(strip=True)
-            last_login = datetime.strptime(last_login_str, "%d.%m.%Y (%H:%M)") if last_login_str else None
-            link_map = cells[0].find("a")["href"] if cells[0].find("a") else None
-
-            houses.append({
-                "name": name,
-                "size": size,
-                "owner": owner,
-                "last_login": last_login_str,
-                "link": link_map
-            })
-        except Exception:
+        except ValueError:
             continue
-    return houses
+        owner = cells[2].get_text(strip=True)
+        last_login_text = cells[3].get_text(strip=True)
+        try:
+            last_login = datetime.strptime(last_login_text, "%d.%m.%Y (%H:%M)")
+        except ValueError:
+            last_login = None
 
+        houses_list.append({
+            "name": name,
+            "map_link": map_link,
+            "size": size,
+            "owner": owner,
+            "last_login": last_login_text
+        })
+
+    return houses_list
+
+# --- CACHE BUILDING ---
 async def build_cache(ctx=None):
     global cache
     houses = fetch_houses()
     cache = []
-
     total = len(houses)
+
     progress_msg = None
+    if ctx:
+        progress_msg = await ctx.send(f"🔄 Budowanie cache: 0/{total}")
 
     for idx, house in enumerate(houses, start=1):
-        # sprawdz minimalny poziom (tutaj uproszczenie, jeśli dostępne w owner)
+        # Tu możesz wstawić filtr np. min level 600 i domki do przejęcia
         cache.append(house)
+        if ctx and progress_msg:
+            await progress_msg.edit(content=f"🔄 Budowanie cache: {idx}/{total}")
 
-        # postęp liczbowy w Discordzie
-        if ctx:
-            text = f"🔄 Budowanie cache: {idx}/{total} domków"
-            if progress_msg is None:
-                progress_msg = await ctx.send(text)
-            else:
-                try:
-                    await progress_msg.edit(content=text)
-                except discord.HTTPException:
-                    pass
-        else:
-            print(f"🔄 Budowanie cache: {idx}/{total} domków")
+    save_cache()
+    if ctx and progress_msg:
+        await progress_msg.edit(content=f"✅ Cache zbudowany. Znaleziono {len(cache)} domków.")
 
-    save_cache_to_file()
-
-    if ctx:
-        done_text = f"✅ Cache zbudowany. Znaleziono {len(cache)} domków."
-        if progress_msg:
-            await progress_msg.edit(content=done_text)
-        else:
-            await ctx.send(done_text)
-    print(f"✅ Cache zbudowany. Znaleziono {len(cache)} domków.")
-
-# --- EVENTS ---
+# --- DISCORD EVENTS ---
 @bot.event
 async def on_ready():
-    print(f"Zalogowano jako {bot.user}")
-    load_cache_from_file()
+    print(f"{bot.user} gotowy!")
     channel = bot.get_channel(DISCORD_CHANNEL)
-    if channel:
-        await build_cache(ctx=channel)
-        await channel.send("✅ Bot gotowy i cache zbudowany.")
+    await build_cache(ctx=channel)
 
 # --- COMMANDS ---
 @bot.command()
@@ -118,34 +105,36 @@ async def status(ctx):
     if not cache:
         await ctx.send("⚠️ Cache nie był jeszcze budowany!")
         return
-    await ctx.send(f"Cache zawiera {len(cache)} domków.")
+    await ctx.send(f"✅ Cache zbudowany. Liczba domków: {len(cache)}")
 
 @bot.command()
 async def sprawdz(ctx):
     if not cache:
         await ctx.send("⚠️ Cache nie był jeszcze budowany!")
         return
-    text_list = []
+
+    text = ""
     for house in cache:
-        line = f"{house['name']} ({house['size']}) - {house['owner']} - {house['last_login']}"
-        if house.get("link"):
-            line += f" [Mapa]({house['link']})"
-        text_list.append(line)
-    
-    # dziel na fragmenty po 1900 znaków, żeby nie przekroczyć limitu Discorda
-    CHUNK_SIZE = 1900
-    for i in range(0, len(text_list), 20):
-        chunk = "\n".join(text_list[i:i+20])
-        await ctx.send(chunk or "Brak domków spełniających kryteria.")
+        text += f"{house['name']} ({house['size']}) - {house['owner']} - [Mapka]({house['map_link']})\n"
+
+    # Discord limit 4000 znaków
+    if len(text) > 4000:
+        chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+        for chunk in chunks:
+            await ctx.send(chunk)
+    else:
+        await ctx.send(text or "Brak domków spełniających kryteria.")
 
 @bot.command()
 async def info(ctx):
-    info_text = """
-**Dostępne komendy:**
-!status - Pokazuje ile domków jest w cache.
-!sprawdz - Pokazuje wszystkie domki spełniające kryteria z linkami do mapy.
-!info - Wyświetla ten opis.
-"""
-    await ctx.send(info_text)
+    msg = (
+        "**Dostępne komendy:**\n"
+        "`!status` - pokazuje status cache i liczbę domków\n"
+        "`!sprawdz` - pokazuje wszystkie domki w cache z linkiem do mapy\n"
+        "`!info` - pokazuje wszystkie komendy i opis"
+    )
+    await ctx.send(msg)
 
+# --- RUN BOT ---
+load_cache()
 bot.run(TOKEN)
