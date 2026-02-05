@@ -3,7 +3,7 @@ from discord.ext import commands, tasks
 import aiohttp
 import asyncio
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -112,7 +112,7 @@ async def update_cache():
 
     async with aiohttp.ClientSession() as session:
         players = await get_all_players(session)
-        progress = {"done": 0, "total": len(players), "start": datetime.utcnow()}
+        progress = {"done": 0, "total": len(players), "start": datetime.now(timezone.utc)}
         cache = []
 
         msg = await channel.send("🔄 Rozpoczynam skan Cylerii...")
@@ -124,7 +124,7 @@ async def update_cache():
                 data = await get_character(session, name)
                 progress["done"] += 1
                 if data:
-                    days = (datetime.utcnow() - data["last"]).days
+                    days = (datetime.now(timezone.utc) - data["last"]).days
                     if days >= 10:
                         data["days"] = days
                         cache.append(data)
@@ -137,7 +137,7 @@ async def update_cache():
             done = progress["done"]
             total = progress["total"]
             percent = int(done / total * 100)
-            elapsed = (datetime.utcnow() - progress["start"]).seconds
+            elapsed = int((datetime.now(timezone.utc) - progress["start"]).total_seconds())
             eta = int(elapsed / done * (total - done)) if done > 0 else 0
 
             await msg.edit(content=f"🔄 Skan Cylerii\nPostęp: {done}/{total} ({percent}%)\nDomków: {len(cache)}\nETA: ~{eta//60}m {eta%60}s")
