@@ -76,12 +76,6 @@ async def get_character_info(name):
                 lvl = 0
             break
 
-    house = None
-    for line in text.splitlines():
-        if "Domek" in line:
-            house = line.split(":", 1)[1].strip()
-            break
-
     last_login = None
     for line in text.splitlines():
         if "Logowanie" in line:
@@ -92,7 +86,7 @@ async def get_character_info(name):
                 last_login = datetime.now(timezone.utc)
             break
 
-    return lvl, house, last_login
+    return lvl, last_login
 
 # ----------------------------
 # UPDATE CACHE
@@ -102,55 +96,49 @@ async def update_cache_channel(channel):
     while True:
         cache_ready = False
         alerted_houses = set()
-        houses_map = await get_all_houses()
-        all_players = []
-
-        # pobierz wszystkich graczy po 2000 na stronę
-        offset = 0
-        while True:
-            url = f"https://cyleria.pl/?subtopic=highscores&list=experience&world=0&minLevel={MIN_LEVEL}&start={offset}"
-            async with aiohttp.ClientSession() as session:
-                html = await fetch(session, url)
-            soup = BeautifulSoup(html, "html.parser")
-            table = soup.find("table")
-            if not table or len(table.find_all("tr")) <= 1:
-                break
-            for row in table.find_all("tr")[1:]:
-                cols = row.find_all("td")
-                if len(cols) < 2:
-                    continue
-                player_name = cols[1].text.strip()
-                all_players.append(player_name)
-            offset += 2000
-
-        total = len(all_players)
+        houses = await get_all_houses()
+        total = len(houses)
         done = 0
         start = datetime.now(timezone.utc)
         new_cache = {}
+
+        if total == 0:
+            await channel.send("⚠️ Nie znaleziono domków na Cylerii.")
+            await asyncio.sleep(600)
+            continue
+
         progress_msg = await channel.send(f"🔄 Budowanie cache: 0/{total}")
 
-        for p in all_players:
-            try:
-                lvl, house, last_login = await get_character_info(p)
-            except:
+        for house_name, house_data in houses.items():
+            owner = house_data["owner"]
+            if not owner:
+                done += 1
                 continue
-            done += 1
-            if house and house in houses_map and lvl >= MIN_LEVEL:
-                offline_days = (datetime.now(timezone.utc) - last_login).days
-                new_cache[p] = {
-                    "lvl": lvl,
-                    "house": house,
-                    "offline_days": offline_days,
-                    "status": houses_map[house]["status"],
-                    "map": houses_map[house]["map"]
-                }
-                # ALERT 13 dni
-                if offline_days == 13 and p not in alerted_houses:
-                    alerted_houses.add(p)
-                    await channel.send(f"⚠️ Domek **{house}** gracza **{p}** osiągnął 13 dni offline!\nMapka: {houses_map[house]['map']}")
+            try:
+                lvl, last_login = await get_character_info(owner)
+            except:
+                done += 1
+                continue
 
-            # PASEK POSTĘPU co 50 graczy
-            if done % 50 == 0:
+            offline_days = (datetime.now(timezone.utc) - last_login).days
+            if lvl >= MIN_LEVEL:
+                new_cache[owner] = {
+                    "lvl": lvl,
+                    "house": house_name,
+                    "offline_days": offline_days,
+                    "status": house_data["status"],
+                    "map": house_data["map"]
+                }
+
+                # ALERT 13 dni
+                if offline_days == 13 and owner not in alerted_houses:
+                    alerted_houses.add(owner)
+                    await channel.send(f"⚠️ Domek **{house_name}** gracza **{owner}** osiągnął 13 dni offline!\nMapka: {house_data['map']}")
+
+            done += 1
+
+            # PASEK POSTĘPU co 5 domków
+            if done % 5 == 0:
                 perc = int(done / total * 100)
                 filled = int(perc / 5)
                 bar = "█" * filled + "-" * (20 - filled)
@@ -184,9 +172,9 @@ async def sprawdz(ctx):
         await ctx.send("Cache nie był jeszcze budowany.")
         return
     result = []
-    for p, data in cache.items():
+    for owner, data in cache.items():
         if data["offline_days"] >= OFFLINE_DAYS:
-            result.append(f"{p} | {data['house']} | {data['offline_days']} dni offline | {data['map']}")
+            result.append(f"{owner} | {data['house']} | {data['offline_days']} dni offline | {data['map']}")
     if not result:
         await ctx.send("Nie znaleziono domków dla tego filtra")
         return
@@ -198,9 +186,9 @@ async def ultra(ctx):
         await ctx.send("Cache nie był jeszcze budowany.")
         return
     result = []
-    for p, data in cache.items():
+    for owner, data in cache.items():
         if data["offline_days"] >= OFFLINE_DAYS and data["lvl"] >= MIN_LEVEL:
-            result.append(f"{p} | {data['house']} | lvl {data['lvl']} | {data['offline_days']} dni offline | {data['map']}")
+            result.append(f"{owner} | {data['house']} | lvl {data['lvl']} | {data['offline_days']} dni offline | {data['map']}")
     if not result:
         await ctx.send("Nie znaleziono domków dla tego filtra")
         return
@@ -213,8 +201,8 @@ async def top20(ctx):
         return
     top = sorted(cache.items(), key=lambda x: x[1]["offline_days"], reverse=True)
     msg = []
-    for p, data in top[:20]:
-        msg.append(f"{p} | {data['house']} | lvl {data['lvl']} | {data['offline_days']} dni offline | {data['map']}")
+    for owner, data in top[:20]:
+        msg.append(f"{owner} | {data['house']} | lvl {data['lvl']} | {data['offline_days']} dni offline | {data['map']}")
     await ctx.send("\n".join(msg))
 
 @bot.command()
@@ -232,6 +220,7 @@ async def on_ready():
     print(f"Zalogowano jako {bot.user}")
     channel = bot.get_channel(CHANNEL_ID)
     if channel:
+        await channel.send("🔄 Rozpoczynam skan Cylerii...")
         asyncio.create_task(update_cache_channel(channel))
     else:
         print("Nie znaleziono kanału!")
